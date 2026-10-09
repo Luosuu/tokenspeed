@@ -266,9 +266,11 @@ class ModelRunner:
         from torch.distributed.distributed_c10d import (
             Backend,
             PrefixStore,
+            _get_default_group,
             _new_process_group_helper,
             _world,
             default_pg_timeout,
+            is_initialized,
             rendezvous,
         )
 
@@ -292,16 +294,32 @@ class ModelRunner:
                 if _parse_version(torch.__version__) >= _parse_version("2.6")
                 else "pg_options"
             )
-            pg, _ = _new_process_group_helper(
-                world_size,
-                rank,
-                [],
-                backend,
-                store,
-                group_name=group_name,
-                **{opt: None},
-                timeout=timeout,
+            # Since torch 2.14 the helper splits a new NCCL group from the
+            # default group whenever that group is bound to a device, as the
+            # engine's is. A split only spans this engine's own ranks, never
+            # the trainer, and the first broadcast would hang; unbind the
+            # default group while creating this one so it is built from the
+            # store instead.
+            default_pg = _get_default_group() if is_initialized() else None
+            bound_device_id = (
+                default_pg.bound_device_id if default_pg is not None else None
             )
+            if bound_device_id is not None:
+                default_pg.bound_device_id = None
+            try:
+                pg, _ = _new_process_group_helper(
+                    world_size,
+                    rank,
+                    [],
+                    backend,
+                    store,
+                    group_name=group_name,
+                    **{opt: None},
+                    timeout=timeout,
+                )
+            finally:
+                if bound_device_id is not None:
+                    default_pg.bound_device_id = bound_device_id
             _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
 
             self._weight_update_pg = pg
