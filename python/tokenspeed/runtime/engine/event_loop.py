@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 import zmq
 from tokenspeed_kernel.compile_monitor import compile_stats
+from tokenspeed_kernel.profiling import proton_available
 from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
@@ -46,6 +47,7 @@ from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks
 from tokenspeed.runtime.engine.load_snapshot import create_load_reporter
 from tokenspeed.runtime.engine.memory_occupation import MemoryOccupationController
 from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
+from tokenspeed.runtime.engine.proton_session import PersistentProtonSession
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     RequestHistoryRows,
@@ -140,6 +142,17 @@ def maybe_warm_cupti_for_graph_capture() -> None:
     from torch.profiler._utils import _init_for_cuda_graphs
 
     _init_for_cuda_graphs()
+
+
+def maybe_start_persistent_proton_session() -> PersistentProtonSession | None:
+    """Start the scheduler's Proton session before any CUDA graph is captured.
+
+    Only with ``TOKENSPEED_PROTON_SESSION_DIR`` set; see ``proton_session``.
+    """
+    directory = envs.TOKENSPEED_PROTON_SESSION_DIR.get()
+    if not directory or not proton_available():
+        return None
+    return PersistentProtonSession.start(directory)
 
 
 class EventLoop:
@@ -1309,16 +1322,24 @@ def run_event_loop(
             "scheduler.init", rank=global_rank, role=server_args.disaggregation_mode
         ):
             maybe_warm_cupti_for_graph_capture()
+            proton_session = maybe_start_persistent_proton_session()
 
-            event_loop = EventLoop(
-                server_args,
-                port_args,
-                gpu_id,
-                attn_tp_rank,
-                dp_rank,
-                global_rank,
-                shutdown_event,
-            )
+            try:
+                event_loop = EventLoop(
+                    server_args,
+                    port_args,
+                    gpu_id,
+                    attn_tp_rank,
+                    dp_rank,
+                    global_rank,
+                    shutdown_event,
+                )
+            except BaseException:
+                if proton_session is not None:
+                    proton_session.close()
+                raise
+            if proton_session is not None:
+                proton_session.park(torch.cuda.current_device())
         pipe_writer.send(
             {
                 "status": "ready",

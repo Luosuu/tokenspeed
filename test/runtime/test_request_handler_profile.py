@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -6,10 +7,12 @@ from unittest import mock
 import torch
 from tokenspeed_kernel import profiling
 
+from tokenspeed.runtime.engine import proton_session as proton_session_mod
 from tokenspeed.runtime.engine import request_handler as request_handler_mod
 from tokenspeed.runtime.engine.io_struct import ProfileReq, ProfileReqType
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.utils.env import envs
 
 
 def _attn_mapping(
@@ -309,6 +312,86 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             self.handler._profile_batch_predicate()
             stop_profiling.assert_called_once()
             self.assertFalse(self.handler.profile_in_progress)
+
+
+class TestRequestHandlerBackgroundSave(unittest.TestCase):
+    """TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND: /stop_profile only stops recording."""
+
+    def setUp(self):
+        self.output_dir = tempfile.mkdtemp()
+        profiling.ProfilingState.reset()
+        self.addCleanup(profiling.ProfilingState.reset)
+        self.release = threading.Event()
+        self.writes = []
+        for patcher in (
+            mock.patch.object(request_handler_mod.torch.distributed, "all_reduce"),
+            mock.patch.object(
+                request_handler_mod, "proton_available", return_value=True
+            ),
+            mock.patch.object(
+                request_handler_mod, "VizTracer", self._viztracer_class()
+            ),
+            mock.patch.object(
+                request_handler_mod, "start_profiling", side_effect=self._start
+            ),
+            mock.patch.object(
+                proton_session_mod,
+                "proton",
+                mock.Mock(finalize=mock.Mock(side_effect=self._finalize)),
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with envs.TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND.override(True):
+            self.handler = _make_handler()
+
+    def _viztracer_class(self):
+        test = self
+
+        class VizTracer:
+            def __init__(self, output_file, **kwargs):
+                self.output_file = output_file
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+            def save(self):
+                test.release.wait(5)
+                test.writes.append(("viztracer", threading.current_thread().name))
+
+        return VizTracer
+
+    def _start(self, config):
+        state = profiling.ProfilingState.get()
+        state._config, state._session, state.enabled = config, 9, True
+
+    def _finalize(self, session, output_format):
+        self.release.wait(5)
+        self.writes.append(("proton", session))
+
+    def test_stop_replies_before_the_files_are_written(self):
+        req = _start_req(self.output_dir)
+        req.activities = ["VIZTRACER", "PROTON"]
+        self.assertTrue(self.handler.profile(req).success)
+
+        result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+
+        self.assertTrue(result.success)
+        self.assertEqual(self.writes, [])
+        self.assertFalse(profiling.ProfilingState.get().active)
+        proton_session_mod.proton.deactivate.assert_called_once_with(9)
+        # The next profile waits for the previous one's files.
+        self.release.set()
+        self.assertTrue(self.handler.profile(req).success)
+        self.assertEqual(
+            sorted(name for name, _ in self.writes), ["proton", "viztracer"]
+        )
+        self.assertNotIn("MainThread", [thread for _, thread in self.writes])
+        self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+        self.handler.profile_writer.wait()
 
 
 if __name__ == "__main__":

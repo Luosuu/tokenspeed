@@ -253,6 +253,13 @@ class Envs:
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
+    # Directory for each scheduler's long-lived Proton session, which makes
+    # Proton profiles work under CUDA graphs (see engine/proton_session.py).
+    # Empty: every /start_profile starts its own session.
+    TOKENSPEED_PROTON_SESSION_DIR = EnvStr("")
+    # /stop_profile replies once recording stops and writes the files on
+    # threads (see engine/profile_writer.py).
+    TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND = EnvBool(False)
     # torch.cuda sync-debug mode armed once serving starts (after capture and
     # tuning, which synchronize legitimately): "warn" reports every host
     # synchronization on a serving path with its Python location, "error"

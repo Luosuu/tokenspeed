@@ -70,6 +70,11 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
 )
+from tokenspeed.runtime.engine.profile_writer import ProfileWriter
+from tokenspeed.runtime.engine.proton_session import (
+    PersistentProtonSession,
+    detach_proton_session,
+)
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -626,6 +631,9 @@ class RequestHandler:
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
         self.viztracer = None
+        self.profile_writer = ProfileWriter(
+            in_background=envs.TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND.get()
+        )
 
     def init_profile(
         self,
@@ -718,6 +726,9 @@ class RequestHandler:
         activities = self.profiler_activities
         with_stack = self.torch_profiler_with_stack
         record_shapes = self.torch_profiler_record_shapes
+        # The process has one VizTracer and one Proton profiler: the previous
+        # profile must be written out of them first.
+        self.profile_writer.wait()
 
         activity_map = {
             "CPU": torch.profiler.ProfilerActivity.CPU,
@@ -748,8 +759,12 @@ class RequestHandler:
                 self.profiler_output_dir,
                 f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.proton",
             )
+            proton_session = PersistentProtonSession.get()
             try:
-                start_profiling(profile_config_from_env(output=proton_output))
+                if proton_session is not None:
+                    proton_session.begin(profile_config_from_env(output=proton_output))
+                else:
+                    start_profiling(profile_config_from_env(output=proton_output))
             except Exception as exc:
                 logger.exception("Failed to start Proton profiling")
                 if self.torch_profiler is not None:
@@ -824,11 +839,13 @@ class RequestHandler:
 
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
-            self.torch_profiler.export_chrome_trace(
+            self.profile_writer.write(
+                "torch",
+                self.torch_profiler.export_chrome_trace,
                 os.path.join(
                     self.profiler_output_dir,
                     f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
-                )
+                ),
             )
             self._profile_sync()
 
@@ -845,10 +862,21 @@ class RequestHandler:
 
         proton_error: Exception | None = None
         if "PROTON" in self.profiler_activities:
-            # Finalizes the session and writes the profile now, while this
-            # process is still alive (shutdown is SIGKILL; no atexit).
+            # Writes the profile while this process is still alive (shutdown
+            # is SIGKILL; no atexit): now, or on a thread (see ProfileWriter).
+            proton_session = PersistentProtonSession.get()
             try:
-                stop_profiling()
+                if proton_session is not None and proton_session.phase is not None:
+                    phase, output = proton_session.stop()
+                    self.profile_writer.write(
+                        "proton", proton_session.write, phase, output
+                    )
+                elif self.profile_writer.in_background:
+                    write = detach_proton_session()
+                    if write is not None:
+                        self.profile_writer.write("proton", write)
+                else:
+                    stop_profiling()
             except Exception as exc:
                 logger.exception("Failed to finalize Proton profiling")
                 proton_error = exc
@@ -858,12 +886,13 @@ class RequestHandler:
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()
-            self.viztracer.save()
+            self.profile_writer.write("viztracer", self.viztracer.save)
             self.viztracer = None
 
         if self.profiler_activities and self.profiler_activities != ["CUDA_PROFILER"]:
+            saved = "being saved" if self.profile_writer.in_background else "saved"
             logger.info(
-                f"Profiling done. Traces are saved to: {self.profiler_output_dir!s}",
+                f"Profiling done. Traces are {saved} to: {self.profiler_output_dir!s}",
             )
 
         self.torch_profiler = None
