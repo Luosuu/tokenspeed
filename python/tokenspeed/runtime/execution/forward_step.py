@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.distributed as dist
 import tqdm
+from tokenspeed_kernel.profiling import kernel_scope
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
@@ -1109,7 +1110,12 @@ class ForwardStepRunner:
                         {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
                     ]
                 )
-            with nvtx_range("graph_replay", color="red"):
+            # While Proton profiles, a scope at the replay (with its flow from
+            # the VizTracer forward) marks where this forward's graph runs;
+            # the replayed kernels keep the scopes they were captured under.
+            with nvtx_range("graph_replay", color="red"), kernel_scope(
+                "cuda_graph", "replay", None, batch_size=padded_bs, num_requests=bs
+            ):
                 graph.replay()
 
             (
