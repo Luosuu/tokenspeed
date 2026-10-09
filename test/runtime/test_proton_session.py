@@ -14,7 +14,6 @@ from tokenspeed.runtime.engine import proton_session as proton_session_mod
 from tokenspeed.runtime.engine import request_handler as request_handler_mod
 from tokenspeed.runtime.engine.io_struct import ProfileReq, ProfileReqType
 from tokenspeed.runtime.engine.proton_session import PersistentProtonSession
-from tokenspeed.runtime.utils.env import envs
 
 
 class FakeProton:
@@ -122,6 +121,7 @@ class TestPersistentProtonSession(unittest.TestCase):
         handler = _make_handler()
         for step in (3, 4):
             output = self._profile(handler, f"step-{step}", f"decode {step}")
+            handler.profile_writer.wait()
             self.assertEqual(
                 json.loads(output.read_text()), {"traceEvents": [f"decode {step}"]}
             )
@@ -136,7 +136,7 @@ class TestPersistentProtonSession(unittest.TestCase):
             PersistentProtonSession,
             "write",
             lambda session, *args: (release.wait(5), write(session, *args))[1],
-        ), envs.TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND.override(True):
+        ):
             handler = _make_handler()
             output = self._profile(handler, "step-3", "decode")
             self.assertFalse(output.exists())

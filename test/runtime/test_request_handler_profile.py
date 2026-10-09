@@ -12,7 +12,6 @@ from tokenspeed.runtime.engine import request_handler as request_handler_mod
 from tokenspeed.runtime.engine.io_struct import ProfileReq, ProfileReqType
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.utils.env import envs
 
 
 def _attn_mapping(
@@ -68,6 +67,23 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         )
         self.profile_sync = sync_patcher.start()
         self.addCleanup(sync_patcher.stop)
+        # /stop_profile stops the session here and finalizes it on a thread.
+        self.proton = mock.Mock()
+        proton_patcher = mock.patch.object(proton_session_mod, "proton", self.proton)
+        proton_patcher.start()
+        self.addCleanup(proton_patcher.stop)
+
+    @staticmethod
+    def _start_session(config):
+        state = profiling.ProfilingState.get()
+        state._config, state._session, state.enabled = config, 9, True
+        return 9
+
+    def _assert_stopped_and_written(self):
+        self.proton.deactivate.assert_called_once_with(9)
+        self.handler.profile_writer.wait()
+        self.proton.finalize.assert_called_once()
+        self.assertFalse(profiling.ProfilingState.get().active)
 
     def test_init_fails_when_proton_unavailable(self):
         with mock.patch.object(
@@ -172,10 +188,8 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         with mock.patch.object(
             request_handler_mod, "proton_available", return_value=True
         ), mock.patch.object(
-            request_handler_mod, "start_profiling"
-        ) as start_profiling, mock.patch.object(
-            request_handler_mod, "stop_profiling"
-        ) as stop_profiling:
+            request_handler_mod, "start_profiling", side_effect=self._start_session
+        ) as start_profiling:
             result = self.handler.profile(_start_req(self.output_dir))
             self.assertTrue(result.success)
             self.assertTrue(self.handler.profile_in_progress)
@@ -183,12 +197,12 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
             config = start_profiling.call_args[0][0]
             self.assertEqual(config.output.rsplit("/", 1)[0], self.output_dir)
             self.assertTrue(config.output.endswith("test-profile-TP3.proton"))
-            stop_profiling.assert_not_called()
+            self.proton.deactivate.assert_not_called()
 
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
             self.assertTrue(result.success)
-            stop_profiling.assert_called_once()
             self.assertFalse(self.handler.profile_in_progress)
+            self._assert_stopped_and_written()
 
     def test_rank_tag_includes_dp_cp_ranks_when_present(self):
         self.assertEqual(
@@ -214,9 +228,7 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
                 request_handler_mod, "proton_available", return_value=True
             ), mock.patch.object(
                 request_handler_mod, "start_profiling"
-            ) as start_profiling, mock.patch.object(
-                request_handler_mod, "stop_profiling"
-            ):
+            ) as start_profiling:
                 result = handler.profile(_start_req(self.output_dir))
                 self.assertTrue(result.success)
                 outputs.append(start_profiling.call_args[0][0].output)
@@ -226,18 +238,18 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.assertTrue(outputs[0].endswith("test-profile-DP0-TP0.proton"))
         self.assertTrue(outputs[1].endswith("test-profile-DP1-TP0.proton"))
 
-    def test_stop_profile_syncs_tp_peers_after_proton_finalize(self):
+    def test_stop_profile_syncs_tp_peers_after_proton_stops(self):
         # Only attn-TP rank 0 replies to /stop_profile; the reply must wait
-        # until every TP peer has finalized its Proton file.
+        # until every TP peer has stopped recording.
         self.handler.attn_tp_cpu_group = object()
 
         with mock.patch.object(
             request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod, "stop_profiling"
-        ) as stop_profiling:
+        ), mock.patch.object(
+            request_handler_mod, "start_profiling", side_effect=self._start_session
+        ):
             self.profile_sync.side_effect = lambda tensor, group: self.assertTrue(
-                stop_profiling.called
+                self.proton.deactivate.called
             )
             self.handler.profile(_start_req(self.output_dir))
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
@@ -274,21 +286,20 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
         self.handler._profile_sync()
         self.profile_sync.assert_not_called()
 
-    def test_stop_profile_reports_proton_finalize_failure(self):
+    def test_stop_profile_reports_proton_stop_failure(self):
         self.handler.attn_tp_cpu_group = object()
+        self.proton.deactivate.side_effect = RuntimeError("deactivate failed")
 
         with mock.patch.object(
             request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod,
-            "stop_profiling",
-            side_effect=RuntimeError("finalize failed"),
+        ), mock.patch.object(
+            request_handler_mod, "start_profiling", side_effect=self._start_session
         ):
             self.handler.profile(_start_req(self.output_dir))
             result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
 
         self.assertFalse(result.success)
-        self.assertIn("Failed to finalize Proton profiling", result.message)
+        self.assertIn("Failed to stop Proton profiling", result.message)
         self.assertFalse(self.handler.profile_in_progress)
         self.profile_sync.assert_called_once_with(
             self.handler._profile_sync_buf, group=self.handler.attn_tp_cpu_group
@@ -297,25 +308,25 @@ class TestRequestHandlerProtonProfile(unittest.TestCase):
     def test_num_steps_window_finalizes_proton(self):
         with mock.patch.object(
             request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod, "stop_profiling"
-        ) as stop_profiling:
+        ), mock.patch.object(
+            request_handler_mod, "start_profiling", side_effect=self._start_session
+        ):
             result = self.handler.profile(_start_req(self.output_dir, num_steps=2))
             self.assertTrue(result.success)
             self.assertTrue(self.handler.profile_in_progress)
 
             self.handler.forward_ct = 1
             self.handler._profile_batch_predicate()
-            stop_profiling.assert_not_called()
+            self.proton.deactivate.assert_not_called()
 
             self.handler.forward_ct = 2
             self.handler._profile_batch_predicate()
-            stop_profiling.assert_called_once()
             self.assertFalse(self.handler.profile_in_progress)
+            self._assert_stopped_and_written()
 
 
 class TestRequestHandlerBackgroundSave(unittest.TestCase):
-    """TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND: /stop_profile only stops recording."""
+    """/stop_profile only stops recording; the files are written on threads."""
 
     def setUp(self):
         self.output_dir = tempfile.mkdtemp()
@@ -342,8 +353,7 @@ class TestRequestHandlerBackgroundSave(unittest.TestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
-        with envs.TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND.override(True):
-            self.handler = _make_handler()
+        self.handler = _make_handler()
 
     def _viztracer_class(self):
         test = self

@@ -20,9 +20,9 @@
 
 """Write profiles off the scheduler's critical path.
 
-With ``TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND``, ``/stop_profile`` only stops
-recording: Torch traces, VizTracer reports and Proton traces are written on
-threads of their own, and the reply comes before the files exist. Writing a
+``/stop_profile`` only stops recording: Torch traces, VizTracer reports and
+Proton traces are written on threads of their own, and the reply comes before
+the files exist. Writing a
 profiled step can take tens of seconds, during which the scheduler, its TP
 peers and every caller waiting for the reply would otherwise stall. The next
 ``/start_profile`` waits for the previous profile's files: the process has
@@ -43,18 +43,14 @@ logger = get_colorful_logger(__name__)
 
 
 class ProfileWriter:
-    """Runs profile writes inline or on threads, and waits for them."""
+    """Runs profile writes on threads, and waits for them."""
 
-    def __init__(self, in_background: bool) -> None:
-        self.in_background = in_background
+    def __init__(self) -> None:
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
 
     def write(self, name: str, function: Callable[..., object], *args) -> None:
-        """Run ``function(*args)``; in the background, a failure is only logged."""
-        if not self.in_background:
-            function(*args)
-            return
+        """Run ``function(*args)`` on a thread; a failure is logged."""
 
         def run() -> None:
             try:

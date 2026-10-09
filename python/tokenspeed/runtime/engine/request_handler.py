@@ -33,7 +33,6 @@ from tokenspeed_kernel.profiling import (
     profile_config_from_env,
     proton_available,
     start_profiling,
-    stop_profiling,
 )
 from viztracer import VizTracer
 
@@ -631,9 +630,7 @@ class RequestHandler:
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
         self.viztracer = None
-        self.profile_writer = ProfileWriter(
-            in_background=envs.TOKENSPEED_PROFILE_SAVE_IN_BACKGROUND.get()
-        )
+        self.profile_writer = ProfileWriter()
 
     def init_profile(
         self,
@@ -862,8 +859,8 @@ class RequestHandler:
 
         proton_error: Exception | None = None
         if "PROTON" in self.profiler_activities:
-            # Writes the profile while this process is still alive (shutdown
-            # is SIGKILL; no atexit): now, or on a thread (see ProfileWriter).
+            # Stops recording now and writes the profile on a thread (see
+            # ProfileWriter); shutdown is SIGKILL, so there is no atexit.
             proton_session = PersistentProtonSession.get()
             try:
                 if proton_session is not None and proton_session.phase is not None:
@@ -871,17 +868,15 @@ class RequestHandler:
                     self.profile_writer.write(
                         "proton", proton_session.write, phase, output
                     )
-                elif self.profile_writer.in_background:
+                else:
                     write = detach_proton_session()
                     if write is not None:
                         self.profile_writer.write("proton", write)
-                else:
-                    stop_profiling()
             except Exception as exc:
-                logger.exception("Failed to finalize Proton profiling")
+                logger.exception("Failed to stop Proton profiling")
                 proton_error = exc
             finally:
-                # Do not reply until every TP peer has finished writing.
+                # Do not reply until every TP peer has stopped recording.
                 self._profile_sync()
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
@@ -890,9 +885,8 @@ class RequestHandler:
             self.viztracer = None
 
         if self.profiler_activities and self.profiler_activities != ["CUDA_PROFILER"]:
-            saved = "being saved" if self.profile_writer.in_background else "saved"
             logger.info(
-                f"Profiling done. Traces are {saved} to: {self.profiler_output_dir!s}",
+                f"Profiling done. Traces are being saved to: {self.profiler_output_dir!s}",
             )
 
         self.torch_profiler = None
@@ -902,7 +896,7 @@ class RequestHandler:
         if proton_error is not None:
             return ProfileReqOutput(
                 success=False,
-                message=f"Failed to finalize Proton profiling: {proton_error}",
+                message=f"Failed to stop Proton profiling: {proton_error}",
             )
         return ProfileReqOutput(success=True, message="Succeeded.")
 
