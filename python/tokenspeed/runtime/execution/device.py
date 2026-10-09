@@ -82,6 +82,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from tokenspeed.runtime.execution.forward_trace import forward_batch_scope
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
@@ -441,16 +442,17 @@ class DeviceHandle:
         executor = self._executor
 
         def _forward():
-            return executor.execute_forward_op(
-                planned.forward_op,
-                planned.sampling_params_list,
-                dp_metadata=planned.dp_metadata,
-                grammar_inputs=planned.grammar_inputs,
-                multimodal_context=planned.multimodal_context,
-                capture_next_input_ids=capture_next_input_ids,
-                ngram_inputs=planned.ngram_inputs,
-                request_history_seeds=planned.request_history_seeds,
-            )
+            with forward_batch_scope(planned.forward_op):
+                return executor.execute_forward_op(
+                    planned.forward_op,
+                    planned.sampling_params_list,
+                    dp_metadata=planned.dp_metadata,
+                    grammar_inputs=planned.grammar_inputs,
+                    multimodal_context=planned.multimodal_context,
+                    capture_next_input_ids=capture_next_input_ids,
+                    ngram_inputs=planned.ngram_inputs,
+                    request_history_seeds=planned.request_history_seeds,
+                )
 
         return PendingExecution(self._thread.submit(_forward))
 
