@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import unittest
@@ -334,6 +335,8 @@ class TestRequestHandlerBackgroundSave(unittest.TestCase):
         self.addCleanup(profiling.ProfilingState.reset)
         self.release = threading.Event()
         self.writes = []
+        self.fail_viztracer = False
+        self.final_existed_during_save = None
         for patcher in (
             mock.patch.object(request_handler_mod.torch.distributed, "all_reduce"),
             mock.patch.object(
@@ -368,8 +371,14 @@ class TestRequestHandlerBackgroundSave(unittest.TestCase):
             def stop(self):
                 pass
 
-            def save(self):
+            def save(self, output_file):
                 test.release.wait(5)
+                if test.fail_viztracer:
+                    raise RuntimeError("disk full")
+                # The final file must not appear before the write completes.
+                test.final_existed_during_save = os.path.exists(self.output_file)
+                with open(output_file, "w") as file:
+                    file.write("{}")
                 test.writes.append(("viztracer", threading.current_thread().name))
 
         return VizTracer
@@ -402,6 +411,36 @@ class TestRequestHandlerBackgroundSave(unittest.TestCase):
         self.assertNotIn("MainThread", [thread for _, thread in self.writes])
         self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
         self.handler.profile_writer.wait()
+
+    def _viztracer_output(self):
+        return os.path.join(self.output_dir, "test-profile-TP0.viztracer.json")
+
+    def test_a_file_appears_only_once_complete(self):
+        req = _start_req(self.output_dir)
+        req.activities = ["VIZTRACER"]
+        self.release.set()
+        self.handler.profile(req)
+        self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+        self.handler.profile_writer.wait()
+
+        self.assertIs(self.final_existed_during_save, False)
+        with open(self._viztracer_output()) as file:
+            self.assertEqual(file.read(), "{}")
+        self.assertEqual(os.listdir(os.path.join(self.output_dir, ".writing")), [])
+
+    def test_a_failed_write_leaves_a_marker(self):
+        req = _start_req(self.output_dir)
+        req.activities = ["VIZTRACER"]
+        self.release.set()
+        self.fail_viztracer = True
+        self.handler.profile(req)
+        result = self.handler.profile(ProfileReq(type=ProfileReqType.STOP_PROFILE))
+        self.handler.profile_writer.wait()
+
+        self.assertTrue(result.success)
+        self.assertFalse(os.path.exists(self._viztracer_output()))
+        with open(f"{self._viztracer_output()}.failed") as file:
+            self.assertIn("disk full", file.read())
 
 
 if __name__ == "__main__":

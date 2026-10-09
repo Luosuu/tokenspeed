@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from collections.abc import Mapping
@@ -836,13 +837,12 @@ class RequestHandler:
 
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
-            self.profile_writer.write(
-                "torch",
-                self.torch_profiler.export_chrome_trace,
+            self.profile_writer.write_atomically(
                 os.path.join(
                     self.profiler_output_dir,
                     f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
                 ),
+                self.torch_profiler.export_chrome_trace,
             )
             self._profile_sync()
 
@@ -865,13 +865,14 @@ class RequestHandler:
             try:
                 if proton_session is not None and proton_session.phase is not None:
                     phase, output = proton_session.stop()
-                    self.profile_writer.write(
-                        "proton", proton_session.write, phase, output
+                    self.profile_writer.write_atomically(
+                        output, functools.partial(proton_session.write, phase)
                     )
                 else:
-                    write = detach_proton_session()
-                    if write is not None:
-                        self.profile_writer.write("proton", write)
+                    detached = detach_proton_session()
+                    if detached is not None:
+                        # Proton writes the file it was started with, in place.
+                        self.profile_writer.write_in_place(*detached)
             except Exception as exc:
                 logger.exception("Failed to stop Proton profiling")
                 proton_error = exc
@@ -881,7 +882,9 @@ class RequestHandler:
 
         if "VIZTRACER" in self.profiler_activities and self.viztracer is not None:
             self.viztracer.stop()
-            self.profile_writer.write("viztracer", self.viztracer.save)
+            self.profile_writer.write_atomically(
+                self.viztracer.output_file, self.viztracer.save
+            )
             self.viztracer = None
 
         if self.profiler_activities and self.profiler_activities != ["CUDA_PROFILER"]:

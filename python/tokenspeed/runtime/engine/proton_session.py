@@ -107,31 +107,30 @@ class PersistentProtonSession:
         state._config, state._session, state.enabled = config, self.id, True
 
     def stop(self) -> tuple[int, str]:
-        """End the profiled phase; returns it and its output for :meth:`write`.
+        """End the profiled phase; returns it and its output file for :meth:`write`.
 
         Kernels keep landing in the next phase, which is discarded, until
         :meth:`write` deactivates the session.
         """
-        phase, output = self.phase, self.config.output
+        phase, output = self.phase, f"{self.config.output}.{FORMAT}"
         self.phase, self.config = None, None
         proton.data.advance_phase(self.id)
         state = ProfilingState.get()
         state._config, state._session, state.enabled = None, None, False
         return phase, output
 
-    def write(self, phase: int, output: str) -> Path:
-        """Write a stopped ``phase`` to ``<output>.chrome_trace``.
+    def write(self, phase: int, path: str) -> None:
+        """Write a stopped ``phase`` to ``path``.
 
         May run on another thread; the next :meth:`begin` must wait for it.
         """
         part = self._complete(phase)
-        target = Path(f"{output}.{FORMAT}")
+        target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(part, target)
         # Phases between profiles hold nothing anyone asked for.
         for stale in self.path.parent.glob(f"{self.path.name}.part_*.{FORMAT}"):
             stale.unlink(missing_ok=True)
-        return target
 
     def _complete(self, phase: int) -> Path:
         """Flush ``phase`` (older than the current one) to its file and deactivate."""
@@ -173,17 +172,20 @@ def _ends_json_object(path: Path) -> bool:
         return file.read().rstrip().endswith(b"}")
 
 
-def detach_proton_session() -> Callable[[], None] | None:
-    """Stop a per-profile session from recording; returns the call that writes it.
+def detach_proton_session() -> tuple[str, Callable[[], None]] | None:
+    """Stop a per-profile session from recording; returns its output file and the call that writes it.
 
     Unlike ``stop_profiling``, this leaves writing the profile to the caller,
     which may do it on another thread. Returns None without an active session.
     """
     state = ProfilingState.get()
     session = state._session if state.active else None
-    output_format = state._config.output_format if state._config is not None else ""
+    config = state._config
     state._config, state._session, state.enabled = None, None, False
     if session is None:
         return None
     proton.deactivate(session)
-    return functools.partial(proton.finalize, session, output_format)
+    output_format = config.output_format if config is not None else ""
+    # Proton appends the format, "hatchet" by default, to the session's output.
+    output = f"{config.output if config is not None else 'profile'}.{output_format or 'hatchet'}"
+    return output, functools.partial(proton.finalize, session, output_format)
