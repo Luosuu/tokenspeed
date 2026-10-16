@@ -25,19 +25,26 @@ forwards served it. While a VizTracer profile runs, each forward is wrapped in
 a ``forward_batch`` slice on the forward thread, with the ``rid`` of every
 request in the batch. The kernel scopes the forward launches, and their flows
 to Proton's kernels, nest inside that slice. Nothing is recorded otherwise.
+
+The caller takes the slice's timestamps itself, with the tracer's ``getts``
+(a C function VizTracer does not record): taken inside a Python helper (a
+context manager's ``__enter__``/``__exit__``), they would fall inside slices
+VizTracer records for that helper, which the ``forward_batch`` slice would then
+partially overlap instead of nesting with.
 """
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import Iterator
 from typing import Any
 
 FORWARD_BATCH_NAME = "forward_batch"
 FORWARD_BATCH_CATEGORY = "tokenspeed.requests"
 
 
-def _active_viztracer():
+def profiling_tracer(forward_op: Any):
+    """The VizTracer profiling ``forward_op``, or ``None`` when nothing is recorded."""
+    if forward_op is None:
+        return None
     try:
         from viztracer import get_tracer
     except ImportError:
@@ -46,27 +53,23 @@ def _active_viztracer():
     return tracer if tracer is not None and tracer.enable else None
 
 
-@contextlib.contextmanager
-def forward_batch_scope(forward_op: Any) -> Iterator[None]:
-    """Record ``forward_op``'s requests around the forward, if VizTracer is profiling."""
-    tracer = _active_viztracer() if forward_op is not None else None
-    if tracer is None:
-        yield
-        return
-    start = tracer.getts()
-    try:
-        yield
-    finally:
-        tracer.add_raw(
-            {
-                "ph": "X",
-                "name": FORWARD_BATCH_NAME,
-                "cat": FORWARD_BATCH_CATEGORY,
-                "ts": start,
-                "dur": tracer.getts() - start,
-                "args": {
-                    "request_ids": [str(rid) for rid in forward_op.request_ids],
-                    "num_extends": int(forward_op.num_extends()),
-                },
-            }
-        )
+def record_forward_batch(
+    tracer: Any, forward_op: Any, start: float, end: float
+) -> None:
+    """Record the ``forward_batch`` slice of a forward from ``start`` to ``end``.
+
+    Both are ``tracer.getts()`` values the caller took around the forward.
+    """
+    tracer.add_raw(
+        {
+            "ph": "X",
+            "name": FORWARD_BATCH_NAME,
+            "cat": FORWARD_BATCH_CATEGORY,
+            "ts": start,
+            "dur": end - start,
+            "args": {
+                "request_ids": [str(rid) for rid in forward_op.request_ids],
+                "num_extends": int(forward_op.num_extends()),
+            },
+        }
+    )

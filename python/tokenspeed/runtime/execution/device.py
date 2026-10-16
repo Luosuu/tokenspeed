@@ -82,7 +82,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from tokenspeed.runtime.execution.forward_trace import forward_batch_scope
+from tokenspeed.runtime.execution.forward_trace import (
+    profiling_tracer,
+    record_forward_batch,
+)
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     PendingExecution,
@@ -442,7 +445,11 @@ class DeviceHandle:
         executor = self._executor
 
         def _forward():
-            with forward_batch_scope(planned.forward_op):
+            tracer = profiling_tracer(planned.forward_op)
+            # Timestamps from the tracer's C clock, outside any recorded
+            # Python frame, so the forward_batch slice nests (forward_trace).
+            start = tracer.getts() if tracer is not None else None
+            try:
                 return executor.execute_forward_op(
                     planned.forward_op,
                     planned.sampling_params_list,
@@ -453,6 +460,11 @@ class DeviceHandle:
                     ngram_inputs=planned.ngram_inputs,
                     request_history_seeds=planned.request_history_seeds,
                 )
+            finally:
+                if tracer is not None:
+                    record_forward_batch(
+                        tracer, planned.forward_op, start, tracer.getts()
+                    )
 
         return PendingExecution(self._thread.submit(_forward))
 
